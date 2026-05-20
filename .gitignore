@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Blender
+*.blend1
+*.blend2
+*.blend@
+*.orig
+
+# Addon test outputs
+baked_textures/
+*.png
+*.jpg
+*.jpeg
+*.tga
+*.tif
+*.tiff
+*.exr
+
+# But keep documentation/preview images if added later
+!docs/**/*.png
+!docs/**/*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.zip
+build/
+dist/
+
+# Claude Code session state
+.claude/
