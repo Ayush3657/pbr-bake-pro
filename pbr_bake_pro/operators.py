@@ -291,8 +291,14 @@ class PBRBAKE_OT_bake_selected(Operator):
         self._success_count = 0
         self._cancelled = False
 
+        # Drive the in-panel progress UI (replaces the cursor-attached progress widget)
+        self._update_ui_state(context,
+                              is_baking=True,
+                              status=f"Starting {self._total_tasks} tasks…",
+                              current=0,
+                              total=self._total_tasks)
+
         wm = context.window_manager
-        wm.progress_begin(0, self._total_tasks)
         self._timer = wm.event_timer_add(0.05, window=context.window)
         wm.modal_handler_add(self)
         self._set_header(context, f"PBR Bake: starting {self._total_tasks} tasks. ESC to cancel.")
@@ -324,19 +330,29 @@ class PBRBAKE_OT_bake_selected(Operator):
         kind = task['kind']
         obj_name = task['obj'].name if task.get('obj') else '?'
 
+        # Status text drives both the window header and the in-panel UI
+        if kind == 'INIT_OBJ':
+            status = f"Preparing {obj_name}"
+        elif kind == 'BAKE':
+            status = f"Baking {task['map']} for {obj_name} ({self._width}×{self._height} @ {self._props.samples} spp)"
+        elif kind == 'FINISH_OBJ':
+            status = f"Finalizing {obj_name}"
+        else:
+            status = ""
+
+        self._set_header(context, f"[{self._task_idx+1}/{self._total_tasks}] {status}")
+        self._update_ui_state(context,
+                              is_baking=True,
+                              status=status,
+                              current=self._task_idx,
+                              total=self._total_tasks)
+
         try:
             if kind == 'INIT_OBJ':
-                self._set_header(context,
-                    f"[{self._task_idx+1}/{self._total_tasks}] Preparing {obj_name}")
                 self._task_init_object(context, task)
             elif kind == 'BAKE':
-                self._set_header(context,
-                    f"[{self._task_idx+1}/{self._total_tasks}] Baking {task['map']} for {obj_name} "
-                    f"({self._width}x{self._height} @ {self._props.samples} spp)")
                 self._task_bake(context, task)
             elif kind == 'FINISH_OBJ':
-                self._set_header(context,
-                    f"[{self._task_idx+1}/{self._total_tasks}] Finalizing {obj_name}")
                 self._task_finish_object(context, task)
                 self._success_count += 1
         except Exception as e:
@@ -345,7 +361,11 @@ class PBRBAKE_OT_bake_selected(Operator):
             self._skip_remaining_for_object(obj_name)
 
         self._task_idx += 1
-        context.window_manager.progress_update(self._task_idx)
+        self._update_ui_state(context,
+                              is_baking=True,
+                              status=status,
+                              current=self._task_idx,
+                              total=self._total_tasks)
         return {'PASS_THROUGH'}
 
     # ----- task plan -----
@@ -740,6 +760,25 @@ class PBRBAKE_OT_bake_selected(Operator):
             except Exception:
                 pass
 
+    def _update_ui_state(self, context, *, is_baking, status="", current=0, total=0):
+        """Push runtime progress to scene properties and force the N-panel to redraw."""
+        try:
+            p = context.scene.pbr_bake
+            p.is_baking = bool(is_baking)
+            p.bake_status = status
+            p.bake_current = int(current)
+            p.bake_total = int(total)
+            p.bake_progress = (float(current) / float(total)) if total > 0 else 0.0
+        except Exception:
+            pass
+        # Tag the 3D viewport N-panel for redraw so the progress bar moves live
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                try:
+                    area.tag_redraw()
+                except Exception:
+                    pass
+
     def _restore_engine(self, scene):
         try:
             scene.render.engine = self._original_engine
@@ -797,11 +836,9 @@ class PBRBAKE_OT_bake_selected(Operator):
             except Exception:
                 pass
             self._timer = None
-        try:
-            wm.progress_end()
-        except Exception:
-            pass
 
+        # Clear the in-panel progress UI
+        self._update_ui_state(context, is_baking=False, status="", current=0, total=0)
         self._clear_header(context)
         for area in context.screen.areas:
             try:
@@ -880,40 +917,31 @@ class PBRBAKE_OT_select_no_maps(Operator):
 class PBRBAKE_OT_preset_ue5(Operator):
     bl_idname = "pbr_bake.preset_ue5"
     bl_label = "Unreal Engine 5"
-    bl_description = "Preset: BaseColor + Normal + ORM (packed), UE naming, PNG"
+    bl_description = (
+        "Toggle the UE5 preset. ON: UE naming + ORM packing + BaseColor/Metallic/Roughness/Normal/AO. "
+        "OFF: standard naming, ORM packing disabled"
+    )
 
     def execute(self, context):
         p = context.scene.pbr_bake
-        p.naming_convention = 'UE'
-        p.file_format = 'PNG'
-        p.bake_basecolor = True
-        p.bake_metallic = True
-        p.bake_roughness = True
-        p.bake_normal = True
-        p.bake_ao = True
-        p.bake_emission = False
-        p.bake_alpha = False
-        p.pack_orm = True
-        return {'FINISHED'}
-
-
-class PBRBAKE_OT_preset_unity(Operator):
-    bl_idname = "pbr_bake.preset_unity"
-    bl_label = "Unity URP"
-    bl_description = "Preset: Albedo + Normal + Metallic + Roughness, Unity naming"
-
-    def execute(self, context):
-        p = context.scene.pbr_bake
-        p.naming_convention = 'UNITY'
-        p.file_format = 'PNG'
-        p.bake_basecolor = True
-        p.bake_metallic = True
-        p.bake_roughness = True
-        p.bake_normal = True
-        p.bake_ao = True
-        p.bake_emission = False
-        p.bake_alpha = False
-        p.pack_orm = False
+        if p.ue5_preset_active:
+            # Toggle OFF — revert to a neutral, non-UE5 state
+            p.ue5_preset_active = False
+            p.naming_convention = 'STANDARD'
+            p.pack_orm = False
+        else:
+            # Toggle ON — apply UE5 preset
+            p.ue5_preset_active = True
+            p.naming_convention = 'UE'
+            p.file_format = 'PNG'
+            p.bake_basecolor = True
+            p.bake_metallic = True
+            p.bake_roughness = True
+            p.bake_normal = True
+            p.bake_ao = True
+            p.bake_emission = False
+            p.bake_alpha = False
+            p.pack_orm = True
         return {'FINISHED'}
 
 
@@ -927,7 +955,6 @@ _classes = (
     PBRBAKE_OT_select_all_maps,
     PBRBAKE_OT_select_no_maps,
     PBRBAKE_OT_preset_ue5,
-    PBRBAKE_OT_preset_unity,
 )
 
 

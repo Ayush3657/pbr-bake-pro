@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pbr_bake_pro"
-version = "1.1.0"
+version = "1.2.0"
 name = "PBR Bake Pro"
 tagline = "Bake materials to PBR textures for game engine export"
 maintainer = "PBR Bake Pro"

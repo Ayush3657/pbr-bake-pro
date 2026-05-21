@@ -1,4 +1,5 @@
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import (
     EnumProperty,
     IntProperty,
@@ -148,12 +149,47 @@ class PBRBakeProperties(PropertyGroup):
         precision=4,
     )
 
+    # --- Preset state ---
+    # True means the UE5 preset is currently active (settings match it).
+    # Defaults match the UE5 preset, so default value is True.
+    ue5_preset_active: BoolProperty(
+        name="UE5 Preset Active",
+        description="Whether the UE5 preset is currently engaged",
+        default=True,
+    )
+
+    # --- Runtime bake state (not user-editable, drives the UI progress bar) ---
+    is_baking: BoolProperty(default=False)
+    bake_progress: FloatProperty(default=0.0, min=0.0, max=1.0, subtype='FACTOR')
+    bake_status: StringProperty(default="")
+    bake_current: IntProperty(default=0, min=0)
+    bake_total: IntProperty(default=0, min=0)
+
+
+@persistent
+def _reset_runtime_state(_dummy):
+    """Clear modal-only state on file load — prevents the panel from showing
+    a 'Baking...' progress bar that's left over from a previous session."""
+    for scene in bpy.data.scenes:
+        p = getattr(scene, 'pbr_bake', None)
+        if p is None:
+            continue
+        p.is_baking = False
+        p.bake_progress = 0.0
+        p.bake_status = ""
+        p.bake_current = 0
+        p.bake_total = 0
+
 
 def register():
     bpy.utils.register_class(PBRBakeProperties)
     bpy.types.Scene.pbr_bake = PointerProperty(type=PBRBakeProperties)
+    if _reset_runtime_state not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_reset_runtime_state)
 
 
 def unregister():
+    if _reset_runtime_state in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_reset_runtime_state)
     del bpy.types.Scene.pbr_bake
     bpy.utils.unregister_class(PBRBakeProperties)

@@ -2,6 +2,13 @@ import bpy
 from bpy.types import Panel
 
 
+def _not_baking(context):
+    """Used by sub-panels' poll() to hide them while a bake is running,
+    so the user sees only the progress UI on the main panel."""
+    p = getattr(context.scene, 'pbr_bake', None)
+    return not (p and p.is_baking)
+
+
 class PBRBAKE_PT_main(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -13,7 +20,30 @@ class PBRBAKE_PT_main(Panel):
         layout = self.layout
         props = context.scene.pbr_bake
 
-        # Bake button
+        # ---- Live progress (shown only while a bake is running) ----
+        if props.is_baking:
+            box = layout.box()
+            head = box.row()
+            head.label(text="Baking…", icon='RENDER_STILL')
+            head.label(text=f"{props.bake_current}/{props.bake_total}")
+
+            # In-panel progress bar (Blender 4.0+: UILayout.progress)
+            try:
+                box.progress(
+                    factor=props.bake_progress,
+                    type='BAR',
+                    text=f"{int(props.bake_progress * 100)}%",
+                )
+            except AttributeError:
+                # Fallback for older Blender — text-only progress
+                box.label(text=f"Progress: {int(props.bake_progress * 100)}%")
+
+            if props.bake_status:
+                box.label(text=props.bake_status)
+            box.label(text="Press ESC to cancel", icon='CANCEL')
+            return  # hide the rest of the panel while baking
+
+        # ---- Bake button ----
         col = layout.column()
         col.scale_y = 1.6
         mesh_count = sum(1 for o in context.selected_objects if o.type == 'MESH')
@@ -21,14 +51,16 @@ class PBRBAKE_PT_main(Panel):
         bake_row.enabled = mesh_count > 0
         bake_row.operator('pbr_bake.bake_selected', icon='RENDER_STILL',
                           text=f"Bake {mesh_count} Object(s)" if mesh_count else "Bake (no selection)")
-        if mesh_count:
-            layout.label(text="Progress shown in header. ESC cancels.", icon='INFO')
 
-        # Presets
+        # ---- Preset toggle (UE5 only) ----
         row = layout.row(align=True)
         row.label(text="Preset:")
-        row.operator('pbr_bake.preset_ue5', text="UE5")
-        row.operator('pbr_bake.preset_unity', text="Unity")
+        row.operator(
+            'pbr_bake.preset_ue5',
+            text="UE5",
+            icon='CHECKBOX_HLT' if props.ue5_preset_active else 'CHECKBOX_DEHLT',
+            depress=props.ue5_preset_active,
+        )
 
 
 class PBRBAKE_PT_resolution(Panel):
@@ -37,6 +69,10 @@ class PBRBAKE_PT_resolution(Panel):
     bl_category = 'PBR Bake'
     bl_label = 'Resolution & Quality'
     bl_parent_id = 'PBRBAKE_PT_main'
+
+    @classmethod
+    def poll(cls, context):
+        return _not_baking(context)
 
     def draw(self, context):
         layout = self.layout
@@ -62,6 +98,10 @@ class PBRBAKE_PT_maps(Panel):
     bl_category = 'PBR Bake'
     bl_label = 'PBR Maps'
     bl_parent_id = 'PBRBAKE_PT_main'
+
+    @classmethod
+    def poll(cls, context):
+        return _not_baking(context)
 
     def draw(self, context):
         layout = self.layout
@@ -95,6 +135,10 @@ class PBRBAKE_PT_output(Panel):
     bl_label = 'Output'
     bl_parent_id = 'PBRBAKE_PT_main'
 
+    @classmethod
+    def poll(cls, context):
+        return _not_baking(context)
+
     def draw(self, context):
         layout = self.layout
         props = context.scene.pbr_bake
@@ -111,6 +155,10 @@ class PBRBAKE_PT_material(Panel):
     bl_category = 'PBR Bake'
     bl_label = 'Material & UVs'
     bl_parent_id = 'PBRBAKE_PT_main'
+
+    @classmethod
+    def poll(cls, context):
+        return _not_baking(context)
 
     def draw(self, context):
         layout = self.layout
@@ -132,6 +180,10 @@ class PBRBAKE_PT_advanced(Panel):
     bl_label = 'High-Poly to Low-Poly'
     bl_parent_id = 'PBRBAKE_PT_main'
     bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return _not_baking(context)
 
     def draw(self, context):
         layout = self.layout
