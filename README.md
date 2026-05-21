@@ -9,17 +9,19 @@ A Blender 5.0+ add-on that bakes any node-based material down to clean PBR textu
 - **ORM channel packing** for UE5 (R=AO, G=Roughness, B=Metallic) in a single texture.
 - **Resolution** presets (256 → 8K) and custom non-square sizes.
 - **Cycles samples** control for quality vs. speed.
-- **Naming presets** for Unreal (`T_Mesh_BC`, `T_Mesh_N`, `T_Mesh_ORM`), Unity (`Mesh_Albedo`, `Mesh_Normal`), or generic.
+- **Naming presets** for Unreal (`T_Mesh_BC`, `T_Mesh_N`, `T_Mesh_ORM`), or generic.
 - **Material replacement**: after baking, the object's material is rebuilt from the baked textures and slot count optionally collapsed to 1 — exports cleanly.
 - **Auto UV unwrap** for objects that don't have a UV map (Smart UV Project).
 - **High-Poly → Low-Poly** bake mode using Blender's Selected-to-Active with cage extrusion.
-- **Engine presets** for UE5 and Unity URP.
+- **Engine presets** for UE5.
 - **Original material kept as backup** by default — nothing is destroyed.
 - Output as PNG / TGA / JPEG / EXR / TIFF.
 
 ## Install
 
-### As an Extension (Blender 5.0+, recommended)
+### As an Extension (Blender 5.0+)
+
+Directly download the latest release and install the addon from disc or download the code and:
 
 1. Zip the `pbr_bake_pro/` folder so the archive contains `pbr_bake_pro/blender_manifest.toml` at its root.
 2. In Blender: `Edit → Preferences → Get Extensions → ▾ menu → Install from Disk…`
@@ -37,11 +39,11 @@ The panel appears in the **3D Viewport → N-panel → PBR Bake** tab.
 ## Usage
 
 1. Select one or more mesh objects.
-2. (Optional) Click the **UE5** or **Unity** preset.
+2. (Optional) Click the **UE5** preset.
 3. Set resolution, samples, output folder.
 4. Click **Bake N Object(s)**.
 
-Each object becomes a self-contained material with baked textures saved to the output folder. Select the objects and export with `File → Export → FBX` or `glTF` — Unreal/Unity will pick up the textures automatically when you import the mesh.
+Each object becomes a self-contained material with baked textures saved to the output folder. Select the objects and export with `File → Export → FBX` or `glTF` — Unreal will pick up the textures automatically when you import the mesh.
 
 ### High-Poly → Low-Poly
 
