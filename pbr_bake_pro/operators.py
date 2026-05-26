@@ -1,5 +1,7 @@
 import os
 import gc
+import math
+import re
 import bpy
 from bpy.types import Operator
 
@@ -102,6 +104,77 @@ def _find_output(mat):
                 return n
             fallback = n
     return fallback
+
+
+_FILENAME_SAFE_RE = re.compile(r'[^A-Za-z0-9._-]+')
+
+
+def _safe_name(s):
+    """Sanitise a string for use in a filename — strip whitespace, weird chars, dots-runs."""
+    out = _FILENAME_SAFE_RE.sub('_', s).strip('_.')
+    return out or "Material"
+
+
+def _wrap_uvs_to_unit(obj):
+    """Translate each face's UV coordinates by integer amounts so they land in [0,1].
+
+    Tileable textures repeat outside [0,1] when sampled, but baking *writes* to the
+    bake target image and pixels outside [0,1] are dropped — producing black patches.
+    By moving each face into the unit square (preserving its relative position within
+    a tile), the visual result is identical but the bake target receives writes.
+
+    Returns (snapshot, straddling_face_count). snapshot is a flat list of (u,v) tuples
+    indexed by mesh loop, suitable for passing to _restore_uvs.
+    """
+    me = obj.data
+    uv = me.uv_layers.active
+    if uv is None:
+        return None, 0
+
+    snapshot = [(d.uv[0], d.uv[1]) for d in uv.data]
+    straddling = 0
+
+    for poly in me.polygons:
+        u_floors = []
+        v_floors = []
+        for li in poly.loop_indices:
+            u = uv.data[li].uv[0]
+            v = uv.data[li].uv[1]
+            u_floors.append(math.floor(u))
+            v_floors.append(math.floor(v))
+        umin, umax = min(u_floors), max(u_floors)
+        vmin, vmax = min(v_floors), max(v_floors)
+        if umin == umax and vmin == vmax:
+            du = umin
+            dv = vmin
+        else:
+            # Face straddles a tile boundary — best effort: snap to the tile that
+            # contains the centroid. May produce a small seam on the boundary edge.
+            straddling += 1
+            n = len(poly.loop_indices)
+            cu = sum(uv.data[li].uv[0] for li in poly.loop_indices) / n
+            cv = sum(uv.data[li].uv[1] for li in poly.loop_indices) / n
+            du = math.floor(cu)
+            dv = math.floor(cv)
+        if du != 0 or dv != 0:
+            for li in poly.loop_indices:
+                uv.data[li].uv[0] -= du
+                uv.data[li].uv[1] -= dv
+
+    return snapshot, straddling
+
+
+def _restore_uvs(obj, snapshot):
+    if snapshot is None:
+        return
+    uv = obj.data.uv_layers.active
+    if uv is None:
+        return
+    n = min(len(snapshot), len(uv.data))
+    for i in range(n):
+        u, v = snapshot[i]
+        uv.data[i].uv[0] = u
+        uv.data[i].uv[1] = v
 
 
 def _ensure_uvs(obj, auto_unwrap, margin_px):
@@ -414,8 +487,9 @@ class PBRBAKE_OT_bake_selected(Operator):
             else:
                 raise RuntimeError("no materials")
 
+        # Per-slot tracking: original material + working copy keyed by slot index
         originals = {}
-        work_mats = []
+        work_mats = {}
         for i, slot in enumerate(obj.material_slots):
             if slot.material is None:
                 continue
@@ -425,12 +499,25 @@ class PBRBAKE_OT_bake_selected(Operator):
             if not work.use_nodes:
                 work.use_nodes = True
             slot.material = work
-            work_mats.append(work)
+            work_mats[i] = work
+
+        # Wrap UVs that lie outside [0,1] back into the bake space so tileable
+        # textures don't produce black patches in the baked result.
+        uv_snapshot = None
+        straddling = 0
+        if self._props.wrap_uvs_to_unit:
+            uv_snapshot, straddling = _wrap_uvs_to_unit(obj)
+            if straddling > 0:
+                print(f"[PBR Bake] {obj.name}: {straddling} face(s) straddle UV tile "
+                      f"boundaries — may show minor seams in bake")
 
         self._obj_state[obj.name] = {
             'originals': originals,
             'work_mats': work_mats,
-            'baked_images': {},
+            'baked_images': {},          # combined mode: {map_type: img}
+            'baked_images_per_slot': {}, # per-slot mode: {slot_idx: {map_type: img}}
+            'uv_snapshot': uv_snapshot,
+            'per_slot': self._props.bake_per_slot and len(originals) > 1,
         }
 
     def _task_bake(self, context, task):
@@ -450,10 +537,19 @@ class PBRBAKE_OT_bake_selected(Operator):
         else:
             self._activate_only(context, obj)
 
-        img = self._bake_one_map(context, obj, state['work_mats'], map_type,
-                                 self._width, self._height, self._out_dir, self._props,
-                                 use_selected_to_active=task['hp_to_lp'])
-        state['baked_images'][map_type] = img
+        result = self._bake_one_map(
+            context, obj, state['work_mats'], state['originals'], map_type,
+            self._width, self._height, self._out_dir, self._props,
+            use_selected_to_active=task['hp_to_lp'],
+            per_slot=state['per_slot'],
+        )
+
+        if state['per_slot']:
+            # result is {slot_idx: img}
+            for slot_idx, img in result.items():
+                state['baked_images_per_slot'].setdefault(slot_idx, {})[map_type] = img
+        else:
+            state['baked_images'][map_type] = result
         gc.collect()
 
     def _task_finish_object(self, context, task):
@@ -462,41 +558,109 @@ class PBRBAKE_OT_bake_selected(Operator):
         if state is None:
             raise RuntimeError("init step did not run")
 
+        try:
+            if state['per_slot']:
+                self._finish_per_slot(obj, state)
+            else:
+                self._finish_combined(obj, state)
+        finally:
+            # Restore the original UVs (we wrapped them into [0,1] for baking)
+            if state.get('uv_snapshot') is not None:
+                _restore_uvs(obj, state['uv_snapshot'])
+
+            # Clean up working material copies
+            for w in state['work_mats'].values():
+                if w and w.users == 0:
+                    try:
+                        bpy.data.materials.remove(w)
+                    except Exception:
+                        pass
+
+            self._obj_state.pop(obj.name, None)
+            gc.collect()
+
+    def _finish_combined(self, obj, state):
         baked_images = state['baked_images']
 
         orm_image = None
         if self._props.pack_orm:
             try:
-                orm_image = self._build_orm(obj, baked_images, self._width, self._height,
-                                            self._out_dir, self._props)
+                orm_image = self._build_orm(
+                    obj.name, baked_images, self._width, self._height,
+                    self._out_dir, self._props,
+                )
             except Exception as e:
                 self._errors.append(f"{obj.name}/ORM: {e}")
                 print(f"[PBR Bake] ORM pack failed for {obj.name}: {e}")
 
-        base_name = list(state['originals'].values())[0].name if state['originals'] else obj.name
+        originals = state['originals']
+        base_name = list(originals.values())[0].name if originals else obj.name
         new_mat = self._build_pbr_material(base_name, baked_images, orm_image, self._props)
 
         if self._props.replace_material:
-            self._apply_new_material(obj, new_mat, state['originals'], self._props)
+            self._apply_new_material(obj, new_mat, originals, self._props)
         else:
-            for i, m in state['originals'].items():
+            for i, m in originals.items():
                 if i < len(obj.material_slots):
                     obj.material_slots[i].material = m
 
-        for w in state['work_mats']:
-            if w and w.users == 0:
-                try:
-                    bpy.data.materials.remove(w)
-                except Exception:
-                    pass
+    def _finish_per_slot(self, obj, state):
+        originals = state['originals']
+        per_slot_images = state['baked_images_per_slot']
+        new_materials = {}  # slot_idx -> new_mat
 
-        self._obj_state.pop(obj.name, None)
-        gc.collect()
+        for slot_idx, baked_images in per_slot_images.items():
+            orig = originals.get(slot_idx)
+            mat_name = _safe_name(orig.name) if orig else f"slot{slot_idx}"
+            tag = f"{obj.name}_{mat_name}"
+
+            orm_image = None
+            if self._props.pack_orm:
+                try:
+                    orm_image = self._build_orm(
+                        tag, baked_images, self._width, self._height,
+                        self._out_dir, self._props,
+                    )
+                except Exception as e:
+                    self._errors.append(f"{obj.name}/slot{slot_idx}/ORM: {e}")
+                    print(f"[PBR Bake] ORM pack failed for {tag}: {e}")
+
+            base_name = orig.name if orig else f"{obj.name}_slot{slot_idx}"
+            new_mat = self._build_pbr_material(base_name, baked_images, orm_image, self._props)
+            new_materials[slot_idx] = new_mat
+
+        if self._props.replace_material:
+            # Keep slot count, assign each new material to its slot. Never consolidate.
+            for slot_idx, new_mat in new_materials.items():
+                if slot_idx < len(obj.material_slots):
+                    obj.material_slots[slot_idx].material = new_mat
+            if not self._props.keep_original_backup:
+                for orig in originals.values():
+                    if orig.users == 0:
+                        try:
+                            bpy.data.materials.remove(orig)
+                        except Exception:
+                            pass
+        else:
+            for i, m in originals.items():
+                if i < len(obj.material_slots):
+                    obj.material_slots[i].material = m
 
     # ----- per-map bake -----
 
-    def _bake_one_map(self, context, obj, work_mats, map_type, width, height, out_dir, props,
-                      use_selected_to_active=False):
+    def _bake_one_map(self, context, obj, work_mats, originals, map_type,
+                      width, height, out_dir, props,
+                      use_selected_to_active=False, per_slot=False):
+        """Bake a single PBR map.
+
+        work_mats / originals: dicts keyed by slot index.
+        per_slot=False: all slots share one bake target image (returns Image).
+        per_slot=True:  each slot gets its own bake target image (returns
+                        {slot_idx: Image}). Cycles writes per-material based
+                        on each material's active image-texture node, so a
+                        single bake() call fills every slot's image with only
+                        the faces using that slot.
+        """
         scene = context.scene
         cycles = scene.cycles
         bake_settings = scene.render.bake
@@ -504,19 +668,23 @@ class PBRBAKE_OT_bake_selected(Operator):
         m = MAP_DEFS[map_type]
         prefix = _prefix(props.naming_convention)
         suffix = _suffix(map_type, props.naming_convention)
-        img_name = f"{prefix}{obj.name}{suffix}"
-        img_path = os.path.join(out_dir, img_name + _ext(props.file_format))
+        ext = _ext(props.file_format)
 
-        img = _create_image(img_name, width, height, m['is_data'], alpha=m['has_alpha'])
-        img.filepath_raw = img_path
-        img.file_format = props.file_format
-        try:
-            img.colorspace_settings.name = m['colorspace']
-        except Exception:
-            pass
+        img_nodes = []        # (mat, node) — for cleanup after bake
+        result_images = {}    # slot_idx -> Image (only used in per_slot mode)
+        combined_image = None
 
-        img_nodes = []
-        for mat in work_mats:
+        def _make_image(name):
+            img = _create_image(name, width, height, m['is_data'], alpha=m['has_alpha'])
+            img.filepath_raw = os.path.join(out_dir, name + ext)
+            img.file_format = props.file_format
+            try:
+                img.colorspace_settings.name = m['colorspace']
+            except Exception:
+                pass
+            return img
+
+        def _attach_image_to(mat, img):
             n = _add_image_node(mat, img)
             for nn in mat.node_tree.nodes:
                 nn.select = False
@@ -524,12 +692,27 @@ class PBRBAKE_OT_bake_selected(Operator):
             mat.node_tree.nodes.active = n
             img_nodes.append((mat, n))
 
+        if per_slot:
+            for slot_idx, mat in work_mats.items():
+                orig = originals.get(slot_idx)
+                mat_tag = _safe_name(orig.name) if orig else f"slot{slot_idx}"
+                img_name = f"{prefix}{obj.name}_{mat_tag}{suffix}"
+                img = _make_image(img_name)
+                _attach_image_to(mat, img)
+                result_images[slot_idx] = img
+        else:
+            img_name = f"{prefix}{obj.name}{suffix}"
+            combined_image = _make_image(img_name)
+            for mat in work_mats.values():
+                _attach_image_to(mat, combined_image)
+
+        # Emission rerouting (for Metallic/Alpha which Cycles can't bake directly)
         emit_states = []
         if m['method'] == 'EMIT_INPUT':
-            for mat in work_mats:
-                state = _setup_emit_input_bake(mat, m['principled_input'])
-                if state is not None:
-                    emit_states.append((mat, state))
+            for mat in work_mats.values():
+                st = _setup_emit_input_bake(mat, m['principled_input'])
+                if st is not None:
+                    emit_states.append((mat, st))
             bake_type = 'EMIT'
         else:
             bake_type = m['method']
@@ -561,8 +744,8 @@ class PBRBAKE_OT_bake_selected(Operator):
                     kwargs['max_ray_distance'] = props.ray_distance
             bpy.ops.object.bake(**kwargs)
         finally:
-            for mat, state in emit_states:
-                _restore_emit_input_bake(mat, state)
+            for mat, st in emit_states:
+                _restore_emit_input_bake(mat, st)
             for mat, node in img_nodes:
                 if node.name in mat.node_tree.nodes:
                     try:
@@ -570,16 +753,26 @@ class PBRBAKE_OT_bake_selected(Operator):
                     except Exception:
                         pass
 
-        try:
-            img.save()
-        except Exception as e:
-            raise RuntimeError(f"failed to save {img_name}: {e}")
-
-        return img
+        # Save all baked images to disk
+        if per_slot:
+            for img in result_images.values():
+                try:
+                    img.save()
+                except Exception as e:
+                    raise RuntimeError(f"failed to save {img.name}: {e}")
+            return result_images
+        else:
+            try:
+                combined_image.save()
+            except Exception as e:
+                raise RuntimeError(f"failed to save {combined_image.name}: {e}")
+            return combined_image
 
     # ----- ORM channel-pack (numpy, memory-safe) -----
 
-    def _build_orm(self, obj, baked_images, width, height, out_dir, props):
+    def _build_orm(self, name_tag, baked_images, width, height, out_dir, props):
+        """name_tag is the per-object (combined) or per-slot ('Object_Material')
+        identifier used in the ORM filename."""
         ao    = baked_images.get('AO')
         rough = baked_images.get('ROUGHNESS')
         metal = baked_images.get('METALLIC')
@@ -592,7 +785,7 @@ class PBRBAKE_OT_bake_selected(Operator):
             raise RuntimeError("numpy not available — ORM packing skipped")
 
         prefix = _prefix(props.naming_convention)
-        img_name = f"{prefix}{obj.name}_ORM"
+        img_name = f"{prefix}{name_tag}_ORM"
         ext = _ext(props.file_format)
         img_path = os.path.join(out_dir, img_name + ext)
 
@@ -803,7 +996,13 @@ class PBRBAKE_OT_bake_selected(Operator):
                             obj.material_slots[i].material = orig
                         except Exception:
                             pass
-            for w in state['work_mats']:
+                # Restore wrapped UVs if a snapshot was taken
+                if state.get('uv_snapshot') is not None:
+                    try:
+                        _restore_uvs(obj, state['uv_snapshot'])
+                    except Exception:
+                        pass
+            for w in state['work_mats'].values():
                 if w and w.users == 0:
                     try:
                         bpy.data.materials.remove(w)

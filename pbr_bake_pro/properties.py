@@ -106,6 +106,15 @@ class PBRBakeProperties(PropertyGroup):
         description="If an object has no UV map, automatically generate one with Smart UV Project before baking",
         default=True,
     )
+    wrap_uvs_to_unit: BoolProperty(
+        name="Wrap UVs Outside [0,1]",
+        description=(
+            "Translate UV islands that lie outside the 0-1 bake space back into it before baking. "
+            "Fixes black patches caused by tileable textures with UVs exceeding bounds. "
+            "Original UVs are restored after the bake completes"
+        ),
+        default=True,
+    )
 
     # --- Material replacement ---
     replace_material: BoolProperty(
@@ -120,8 +129,18 @@ class PBRBakeProperties(PropertyGroup):
     )
     consolidate_slots: BoolProperty(
         name="Consolidate Material Slots",
-        description="Collapse all material slots on the object into a single slot using the baked material",
+        description="Collapse all material slots on the object into a single slot using the baked material. Ignored when Per-Slot Baking is on",
         default=True,
+    )
+    bake_per_slot: BoolProperty(
+        name="Per Material Slot",
+        description=(
+            "Bake each material slot to its own complete texture set with its own baked PBR material. "
+            "Use when an object has multiple distinct materials (e.g. wood + fabric) "
+            "that should stay separate after baking. Cycles writes per-material based on each "
+            "material's active image-texture node, so all slots are baked together in one pass"
+        ),
+        default=False,
     )
 
     # --- Selected to Active (HP -> LP) ---

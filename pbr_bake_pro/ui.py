@@ -164,12 +164,28 @@ class PBRBAKE_PT_material(Panel):
         layout = self.layout
         props = context.scene.pbr_bake
 
+        # UV handling
         layout.prop(props, 'auto_uv_unwrap')
+        layout.prop(props, 'wrap_uvs_to_unit')
+
         layout.separator()
+
+        # Per-slot vs combined baking
+        layout.prop(props, 'bake_per_slot', icon='MATERIAL_DATA')
+        if props.bake_per_slot:
+            box = layout.box()
+            box.label(text="Each material slot bakes to its own texture set", icon='INFO')
+
+        layout.separator()
+
+        # Material replacement
         layout.prop(props, 'replace_material')
         sub = layout.column()
         sub.enabled = props.replace_material
-        sub.prop(props, 'consolidate_slots')
+        consolidate_row = sub.row()
+        # Per-slot mode preserves slots — consolidation can't apply
+        consolidate_row.enabled = not props.bake_per_slot
+        consolidate_row.prop(props, 'consolidate_slots')
         sub.prop(props, 'keep_original_backup')
 
 
